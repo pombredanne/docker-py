@@ -15,6 +15,7 @@
 import io
 import tarfile
 import tempfile
+from distutils.version import StrictVersion
 
 import requests
 import six
@@ -51,12 +52,77 @@ def tar(path):
 
 
 def compare_version(v1, v2):
-    return float(v2) - float(v1)
+    """Compare docker versions
+
+    >>> v1 = '1.9'
+    >>> v2 = '1.10'
+    >>> compare_version(v1, v2)
+    1
+    >>> compare_version(v2, v1)
+    -1
+    >>> compare_version(v2, v2)
+    0
+    """
+    s1 = StrictVersion(v1)
+    s2 = StrictVersion(v2)
+    if s1 == s2:
+        return 0
+    elif s1 > s2:
+        return -1
+    else:
+        return 1
 
 
 def ping(url):
     try:
         res = requests.get(url)
-        return res.status >= 400
     except Exception:
         return False
+    else:
+        return res.status_code < 400
+
+
+def _convert_port_binding(binding):
+    result = {'HostIp': '', 'HostPort': ''}
+    if isinstance(binding, tuple):
+        if len(binding) == 2:
+            result['HostPort'] = binding[1]
+            result['HostIp'] = binding[0]
+        elif isinstance(binding[0], six.string_types):
+            result['HostIp'] = binding[0]
+        else:
+            result['HostPort'] = binding[0]
+    else:
+        result['HostPort'] = binding
+
+    if result['HostPort'] is None:
+        result['HostPort'] = ''
+    else:
+        result['HostPort'] = str(result['HostPort'])
+
+    return result
+
+
+def convert_port_bindings(port_bindings):
+    result = {}
+    for k, v in six.iteritems(port_bindings):
+        key = str(k)
+        if '/' not in key:
+            key = key + '/tcp'
+        if isinstance(v, list):
+            result[key] = [_convert_port_binding(binding) for binding in v]
+        else:
+            result[key] = [_convert_port_binding(v)]
+    return result
+
+
+def parse_repository_tag(repo):
+    column_index = repo.rfind(':')
+    if column_index < 0:
+        return repo, ""
+    tag = repo[column_index+1:]
+    slash_index = tag.find('/')
+    if slash_index < 0:
+        return repo[:column_index], tag
+
+    return repo, ""
