@@ -20,6 +20,7 @@ import os
 import signal
 import tempfile
 import unittest
+import gzip
 
 import docker
 import requests
@@ -38,10 +39,8 @@ def response(status_code=200, content='', headers=None, reason=None, elapsed=0,
              request=None):
     res = requests.Response()
     res.status_code = status_code
-    if not isinstance(content, six.string_types):
-        content = json.dumps(content)
-    if six.PY3:
-        content = content.encode('ascii')
+    if not isinstance(content, six.binary_type):
+        content = json.dumps(content).encode('ascii')
     res._content = content
     res.headers = requests.structures.CaseInsensitiveDict(headers or {})
     res.reason = reason
@@ -160,6 +159,7 @@ class DockerClientTest(unittest.TestCase):
             params={
                 'all': 1,
                 'since': None,
+                'size': 0,
                 'limit': -1,
                 'trunc_cmd': 1,
                 'before': None
@@ -186,7 +186,8 @@ class DockerClientTest(unittest.TestCase):
                              "AttachStdin": false, "Memory": 0,
                              "AttachStderr": true, "AttachStdout": true,
                              "StdinOnce": false,
-                             "OpenStdin": false, "NetworkDisabled": false}'''))
+                             "OpenStdin": false, "NetworkDisabled": false,
+                             "MemorySwap": 0}'''))
         self.assertEqual(args[1]['headers'],
                          {'Content-Type': 'application/json'})
 
@@ -210,7 +211,8 @@ class DockerClientTest(unittest.TestCase):
                              "AttachStderr": true,
                              "AttachStdout": true, "OpenStdin": false,
                              "StdinOnce": false,
-                             "NetworkDisabled": false}'''))
+                             "NetworkDisabled": false,
+                             "MemorySwap": 0}'''))
         self.assertEqual(args[1]['headers'],
                          {'Content-Type': 'application/json'})
 
@@ -236,7 +238,8 @@ class DockerClientTest(unittest.TestCase):
                              "AttachStderr": true,
                              "AttachStdout": true, "OpenStdin": false,
                              "StdinOnce": false,
-                             "NetworkDisabled": false}'''))
+                             "NetworkDisabled": false,
+                             "MemorySwap": 0}'''))
         self.assertEqual(args[1]['headers'],
                          {'Content-Type': 'application/json'})
 
@@ -259,7 +262,8 @@ class DockerClientTest(unittest.TestCase):
                              "AttachStdout": true, "OpenStdin": false,
                              "StdinOnce": false,
                              "NetworkDisabled": false,
-                             "Entrypoint": "cowsay"}'''))
+                             "Entrypoint": "cowsay",
+                             "MemorySwap": 0}'''))
         self.assertEqual(args[1]['headers'],
                          {'Content-Type': 'application/json'})
 
@@ -282,7 +286,8 @@ class DockerClientTest(unittest.TestCase):
                              "AttachStdout": true, "OpenStdin": false,
                              "StdinOnce": false,
                              "NetworkDisabled": false,
-                             "CpuShares": 5}'''))
+                             "CpuShares": 5,
+                             "MemorySwap": 0}'''))
         self.assertEqual(args[1]['headers'],
                          {'Content-Type': 'application/json'})
 
@@ -305,7 +310,8 @@ class DockerClientTest(unittest.TestCase):
                              "AttachStdout": true, "OpenStdin": false,
                              "StdinOnce": false,
                              "NetworkDisabled": false,
-                             "WorkingDir": "/root"}'''))
+                             "WorkingDir": "/root",
+                             "MemorySwap": 0}'''))
         self.assertEqual(args[1]['headers'],
                          {'Content-Type': 'application/json'})
 
@@ -324,7 +330,8 @@ class DockerClientTest(unittest.TestCase):
                              "AttachStdin": true, "Memory": 0,
                              "AttachStderr": true, "AttachStdout": true,
                              "StdinOnce": true,
-                             "OpenStdin": true, "NetworkDisabled": false}'''))
+                             "OpenStdin": true, "NetworkDisabled": false,
+                             "MemorySwap": 0}'''))
         self.assertEqual(args[1]['headers'],
                          {'Content-Type': 'application/json'})
 
@@ -333,6 +340,11 @@ class DockerClientTest(unittest.TestCase):
         try:
             self.client.create_container('busybox', 'true',
                                          volumes_from=vol_names)
+        except docker.errors.DockerException as e:
+            self.assertTrue(
+                docker.utils.compare_version('1.10', self.client._version) >= 0
+            )
+            return
         except Exception as e:
             self.fail('Command should not raise exception: {0}'.format(e))
         args = fake_request.call_args
@@ -341,6 +353,16 @@ class DockerClientTest(unittest.TestCase):
                          ','.join(vol_names))
         self.assertEqual(args[1]['headers'],
                          {'Content-Type': 'application/json'})
+
+    def test_create_container_empty_volumes_from(self):
+        try:
+            self.client.create_container('busybox', 'true', volumes_from=[])
+        except Exception as e:
+            self.fail('Command should not raise exception: {0}'.format(e))
+
+        args = fake_request.call_args
+        data = json.loads(args[1]['data'])
+        self.assertTrue('VolumesFrom' not in data)
 
     def test_create_named_container(self):
         try:
@@ -358,7 +380,8 @@ class DockerClientTest(unittest.TestCase):
                              "AttachStdin": false, "Memory": 0,
                              "AttachStderr": true, "AttachStdout": true,
                              "StdinOnce": false,
-                             "OpenStdin": false, "NetworkDisabled": false}'''))
+                             "OpenStdin": false, "NetworkDisabled": false,
+                             "MemorySwap": 0}'''))
         self.assertEqual(args[1]['headers'],
                          {'Content-Type': 'application/json'})
         self.assertEqual(args[1]['params'], {'name': 'marisa-kirisame'})
@@ -441,12 +464,15 @@ class DockerClientTest(unittest.TestCase):
             docker.client.DEFAULT_TIMEOUT_SECONDS
         )
 
-    def test_start_container_with_binds(self):
+    def test_start_container_with_binds_ro(self):
         try:
             mount_dest = '/mnt'
             mount_origin = '/tmp'
             self.client.start(fake_api.FAKE_CONTAINER_ID,
-                              binds={mount_origin: mount_dest})
+                              binds={mount_origin: {
+                                  "bind": mount_dest,
+                                  "ro": True
+                              }})
         except Exception as e:
             self.fail('Command should not raise exception: {0}'.format(e))
 
@@ -454,7 +480,30 @@ class DockerClientTest(unittest.TestCase):
         self.assertEqual(args[0][0], url_prefix +
                          'containers/3cc2351ab11b/start')
         self.assertEqual(json.loads(args[1]['data']),
-                         {"Binds": ["/tmp:/mnt"],
+                         {"Binds": ["/tmp:/mnt:ro"],
+                          "PublishAllPorts": False,
+                          "Privileged": False})
+        self.assertEqual(args[1]['headers'],
+                         {'Content-Type': 'application/json'})
+        self.assertEqual(
+            args[1]['timeout'],
+            docker.client.DEFAULT_TIMEOUT_SECONDS)
+
+    def test_start_container_with_binds_rw(self):
+        try:
+            mount_dest = '/mnt'
+            mount_origin = '/tmp'
+            self.client.start(fake_api.FAKE_CONTAINER_ID,
+                              binds={mount_origin: {
+                                     "bind": mount_dest, "ro": False}})
+        except Exception as e:
+            self.fail('Command should not raise exception: {0}'.format(e))
+
+        args = fake_request.call_args
+        self.assertEqual(args[0][0], url_prefix +
+                         'containers/3cc2351ab11b/start')
+        self.assertEqual(json.loads(args[1]['data']),
+                         {"Binds": ["/tmp:/mnt:rw"],
                           "PublishAllPorts": False,
                           "Privileged": False})
         self.assertEqual(args[1]['headers'],
@@ -642,6 +691,22 @@ class DockerClientTest(unittest.TestCase):
             docker.client.DEFAULT_TIMEOUT_SECONDS
         )
 
+    def test_resize_container(self):
+        try:
+            self.client.resize(
+                {'Id': fake_api.FAKE_CONTAINER_ID},
+                height=15,
+                width=120
+            )
+        except Exception as e:
+            self.fail('Command should not raise exception: {0}'.format(e))
+
+        fake_request.assert_called_with(
+            url_prefix + 'containers/3cc2351ab11b/resize',
+            params={'h': 15, 'w': 120},
+            timeout=docker.client.DEFAULT_TIMEOUT_SECONDS
+        )
+
     def test_wait(self):
         try:
             self.client.wait(fake_api.FAKE_CONTAINER_ID)
@@ -681,39 +746,49 @@ class DockerClientTest(unittest.TestCase):
         assert c.base_url == "http+unix://socket"
 
     def test_url_compatibility_http(self):
-        c = docker.Client(base_url="http://hostname")
+        c = docker.Client(base_url="http://hostname:1234")
 
-        assert c.base_url == "http://hostname"
+        assert c.base_url == "http://hostname:1234"
 
     def test_url_compatibility_tcp(self):
-        c = docker.Client(base_url="tcp://hostname")
+        c = docker.Client(base_url="tcp://hostname:1234")
 
-        assert c.base_url == "http://hostname"
+        assert c.base_url == "http://hostname:1234"
 
     def test_logs(self):
         try:
-            self.client.logs(fake_api.FAKE_CONTAINER_ID)
+            logs = self.client.logs(fake_api.FAKE_CONTAINER_ID)
         except Exception as e:
             self.fail('Command should not raise exception: {0}'.format(e))
 
         fake_request.assert_called_with(
-            url_prefix + 'containers/3cc2351ab11b/attach',
-            params={'stream': 0, 'logs': 1, 'stderr': 1, 'stdout': 1},
+            url_prefix + 'containers/3cc2351ab11b/logs',
+            params={'timestamps': 0, 'follow': 0, 'stderr': 1, 'stdout': 1},
             timeout=docker.client.DEFAULT_TIMEOUT_SECONDS,
             stream=False
         )
 
+        self.assertEqual(
+            logs,
+            'Flowering Nights\n(Sakuya Iyazoi)\n'.encode('ascii')
+        )
+
     def test_logs_with_dict_instead_of_id(self):
         try:
-            self.client.logs({'Id': fake_api.FAKE_CONTAINER_ID})
+            logs = self.client.logs({'Id': fake_api.FAKE_CONTAINER_ID})
         except Exception as e:
             self.fail('Command should not raise exception: {0}'.format(e))
 
         fake_request.assert_called_with(
-            url_prefix + 'containers/3cc2351ab11b/attach',
-            params={'stream': 0, 'logs': 1, 'stderr': 1, 'stdout': 1},
+            url_prefix + 'containers/3cc2351ab11b/logs',
+            params={'timestamps': 0, 'follow': 0, 'stderr': 1, 'stdout': 1},
             timeout=docker.client.DEFAULT_TIMEOUT_SECONDS,
             stream=False
+        )
+
+        self.assertEqual(
+            logs,
+            'Flowering Nights\n(Sakuya Iyazoi)\n'.encode('ascii')
         )
 
     def test_log_streaming(self):
@@ -723,8 +798,8 @@ class DockerClientTest(unittest.TestCase):
             self.fail('Command should not raise exception: {0}'.format(e))
 
         fake_request.assert_called_with(
-            url_prefix + 'containers/3cc2351ab11b/attach',
-            params={'stream': 1, 'logs': 1, 'stderr': 1, 'stdout': 1},
+            url_prefix + 'containers/3cc2351ab11b/logs',
+            params={'timestamps': 0, 'follow': 1, 'stderr': 1, 'stdout': 1},
             timeout=docker.client.DEFAULT_TIMEOUT_SECONDS,
             stream=True
         )
@@ -854,7 +929,7 @@ class DockerClientTest(unittest.TestCase):
 
         fake_request.assert_called_with(
             url_prefix + 'containers/3cc2351ab11b',
-            params={'v': False, 'link': False},
+            params={'v': False, 'link': False, 'force': False},
             timeout=docker.client.DEFAULT_TIMEOUT_SECONDS
         )
 
@@ -866,7 +941,7 @@ class DockerClientTest(unittest.TestCase):
 
         fake_request.assert_called_with(
             url_prefix + 'containers/3cc2351ab11b',
-            params={'v': False, 'link': False},
+            params={'v': False, 'link': False, 'force': False},
             timeout=docker.client.DEFAULT_TIMEOUT_SECONDS
         )
 
@@ -878,7 +953,7 @@ class DockerClientTest(unittest.TestCase):
 
         fake_request.assert_called_with(
             url_prefix + 'containers/3cc2351ab11b',
-            params={'v': False, 'link': True},
+            params={'v': False, 'link': True, 'force': False},
             timeout=docker.client.DEFAULT_TIMEOUT_SECONDS
         )
 
@@ -983,6 +1058,7 @@ class DockerClientTest(unittest.TestCase):
 
         fake_request.assert_called_with(
             url_prefix + 'images/e9aa60c60128',
+            params={'force': False, 'noprune': False},
             timeout=docker.client.DEFAULT_TIMEOUT_SECONDS
         )
 
@@ -1079,6 +1155,11 @@ class DockerClientTest(unittest.TestCase):
         try:
             self.client.insert(fake_api.FAKE_IMAGE_NAME,
                                fake_api.FAKE_URL, fake_api.FAKE_PATH)
+        except docker.errors.DeprecatedMethod as e:
+            self.assertTrue(
+                docker.utils.compare_version('1.12', self.client._version) >= 0
+            )
+            return
         except Exception as e:
             self.fail('Command should not raise exception: {0}'.format(e))
 
@@ -1172,6 +1253,30 @@ class DockerClientTest(unittest.TestCase):
             timeout=docker.client.DEFAULT_TIMEOUT_SECONDS
         )
 
+    def test_get_image(self):
+        try:
+            self.client.get_image(fake_api.FAKE_IMAGE_ID)
+        except Exception as e:
+            self.fail('Command should not raise exception: {0}'.format(e))
+
+        fake_request.assert_called_with(
+            url_prefix + 'images/e9aa60c60128/get',
+            stream=True,
+            timeout=docker.client.DEFAULT_TIMEOUT_SECONDS
+        )
+
+    def test_load_image(self):
+        try:
+            self.client.load_image('Byte Stream....')
+        except Exception as e:
+            self.fail('Command should not raise exception: {0}'.format(e))
+
+        fake_request.assert_called_with(
+            url_prefix + 'images/load',
+            data='Byte Stream....',
+            timeout=docker.client.DEFAULT_TIMEOUT_SECONDS
+        )
+
     #################
     # BUILDER TESTS #
     #################
@@ -1201,6 +1306,41 @@ class DockerClientTest(unittest.TestCase):
         ]).encode('ascii'))
         try:
             self.client.build(fileobj=script, stream=True)
+        except Exception as e:
+            self.fail('Command should not raise exception: {0}'.format(e))
+
+    def test_build_container_custom_context(self):
+        script = io.BytesIO('\n'.join([
+            'FROM busybox',
+            'MAINTAINER docker-py',
+            'RUN mkdir -p /tmp/test',
+            'EXPOSE 8080',
+            'ADD https://dl.dropboxusercontent.com/u/20637798/silence.tar.gz'
+            ' /tmp/silence.tar.gz'
+        ]).encode('ascii'))
+        context = docker.utils.mkbuildcontext(script)
+        try:
+            self.client.build(fileobj=context, custom_context=True)
+        except Exception as e:
+            self.fail('Command should not raise exception: {0}'.format(e))
+
+    def test_build_container_custom_context_gzip(self):
+        script = io.BytesIO('\n'.join([
+            'FROM busybox',
+            'MAINTAINER docker-py',
+            'RUN mkdir -p /tmp/test',
+            'EXPOSE 8080',
+            'ADD https://dl.dropboxusercontent.com/u/20637798/silence.tar.gz'
+            ' /tmp/silence.tar.gz'
+        ]).encode('ascii'))
+        context = docker.utils.mkbuildcontext(script)
+        gz_context = gzip.GzipFile(fileobj=context)
+        try:
+            self.client.build(
+                fileobj=gz_context,
+                custom_context=True,
+                encoding="gzip"
+            )
         except Exception as e:
             self.fail('Command should not raise exception: {0}'.format(e))
 

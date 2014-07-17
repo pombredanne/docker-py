@@ -14,8 +14,10 @@
 
 import time
 import base64
+import json
 import io
 import os
+import shutil
 import signal
 import tempfile
 import unittest
@@ -24,31 +26,36 @@ import docker
 import six
 
 # FIXME: missing tests for
-# export; history; import_image; insert; port; push; tag
+# export; history; import_image; insert; port; push; tag; get; load
+
+DEFAULT_BASE_URL = os.environ.get('DOCKER_HOST')
 
 
 class BaseTestCase(unittest.TestCase):
     tmp_imgs = []
     tmp_containers = []
+    tmp_folders = []
 
     def setUp(self):
-        self.client = docker.Client()
-        self.client.pull('busybox')
+        self.client = docker.Client(base_url=DEFAULT_BASE_URL, timeout=5)
         self.tmp_imgs = []
         self.tmp_containers = []
+        self.tmp_folders = []
 
     def tearDown(self):
         for img in self.tmp_imgs:
             try:
                 self.client.remove_image(img)
-            except docker.APIError:
+            except docker.errors.APIError:
                 pass
         for container in self.tmp_containers:
             try:
                 self.client.stop(container, timeout=1)
                 self.client.remove_container(container)
-            except docker.APIError:
+            except docker.errors.APIError:
                 pass
+        for folder in self.tmp_folders:
+            shutil.rmtree(folder)
 
 #########################
 #   INFORMATION TESTS   #
@@ -108,7 +115,7 @@ class TestListContainers(BaseTestCase):
     def runTest(self):
         res0 = self.client.containers(all=True)
         size = len(res0)
-        res1 = self.client.create_container('busybox', 'true;')
+        res1 = self.client.create_container('busybox:latest', 'true')
         self.assertIn('Id', res1)
         self.client.start(res1['Id'])
         self.tmp_containers.append(res1['Id'])
@@ -118,9 +125,9 @@ class TestListContainers(BaseTestCase):
         self.assertEqual(len(retrieved), 1)
         retrieved = retrieved[0]
         self.assertIn('Command', retrieved)
-        self.assertEqual(retrieved['Command'], 'true;')
+        self.assertEqual(retrieved['Command'], u'true')
         self.assertIn('Image', retrieved)
-        self.assertEqual(retrieved['Image'], 'busybox:latest')
+        self.assertRegexpMatches(retrieved['Image'], r'busybox:.*')
         self.assertIn('Status', retrieved)
 
 #####################
@@ -138,7 +145,8 @@ class TestCreateContainer(BaseTestCase):
 class TestCreateContainerWithBinds(BaseTestCase):
     def runTest(self):
         mount_dest = '/mnt'
-        mount_origin = '/tmp'
+        mount_origin = tempfile.mkdtemp()
+        self.tmp_folders.append(mount_origin)
 
         filename = 'shared.txt'
         shared_file = os.path.join(mount_origin, filename)
@@ -149,7 +157,15 @@ class TestCreateContainerWithBinds(BaseTestCase):
                 ['ls', mount_dest], volumes={mount_dest: {}}
             )
             container_id = container['Id']
-            self.client.start(container_id, binds={mount_origin: mount_dest})
+            self.client.start(
+                container_id,
+                binds={
+                    mount_origin: {
+                        'bind': mount_dest,
+                        'ro': False,
+                    },
+                },
+            )
             self.tmp_containers.append(container_id)
             exitcode = self.client.wait(container_id)
             self.assertEqual(exitcode, 0)
@@ -177,8 +193,8 @@ class TestStartContainer(BaseTestCase):
         self.client.start(res['Id'])
         inspect = self.client.inspect_container(res['Id'])
         self.assertIn('Config', inspect)
-        self.assertIn('ID', inspect)
-        self.assertTrue(inspect['ID'].startswith(res['Id']))
+        self.assertIn('Id', inspect)
+        self.assertTrue(inspect['Id'].startswith(res['Id']))
         self.assertIn('Image', inspect)
         self.assertIn('State', inspect)
         self.assertIn('Running', inspect['State'])
@@ -195,8 +211,8 @@ class TestStartContainerWithDictInsteadOfId(BaseTestCase):
         self.client.start(res)
         inspect = self.client.inspect_container(res['Id'])
         self.assertIn('Config', inspect)
-        self.assertIn('ID', inspect)
-        self.assertTrue(inspect['ID'].startswith(res['Id']))
+        self.assertIn('Id', inspect)
+        self.assertTrue(inspect['Id'].startswith(res['Id']))
         self.assertIn('Image', inspect)
         self.assertIn('State', inspect)
         self.assertIn('Running', inspect['State'])
@@ -213,8 +229,8 @@ class TestStartContainerPrivileged(BaseTestCase):
         self.client.start(res['Id'], privileged=True)
         inspect = self.client.inspect_container(res['Id'])
         self.assertIn('Config', inspect)
-        self.assertIn('ID', inspect)
-        self.assertTrue(inspect['ID'].startswith(res['Id']))
+        self.assertIn('Id', inspect)
+        self.assertTrue(inspect['Id'].startswith(res['Id']))
         self.assertIn('Image', inspect)
         self.assertIn('State', inspect)
         self.assertIn('Running', inspect['State'])
@@ -224,12 +240,13 @@ class TestStartContainerPrivileged(BaseTestCase):
         # Since Nov 2013, the Privileged flag is no longer part of the
         # container's config exposed via the API (safety concerns?).
         #
-        # self.assertEqual(inspect['Config']['Privileged'], True)
+        if 'Privileged' in inspect['Config']:
+            self.assertEqual(inspect['Config']['Privileged'], True)
 
 
 class TestWait(BaseTestCase):
     def runTest(self):
-        res = self.client.create_container('busybox', ['sleep', '10'])
+        res = self.client.create_container('busybox', ['sleep', '3'])
         id = res['Id']
         self.tmp_containers.append(id)
         self.client.start(id)
@@ -244,7 +261,7 @@ class TestWait(BaseTestCase):
 
 class TestWaitWithDictInsteadOfId(BaseTestCase):
     def runTest(self):
-        res = self.client.create_container('busybox', ['sleep', '10'])
+        res = self.client.create_container('busybox', ['sleep', '3'])
         id = res['Id']
         self.tmp_containers.append(id)
         self.client.start(res)
@@ -269,26 +286,26 @@ class TestLogs(BaseTestCase):
         exitcode = self.client.wait(id)
         self.assertEqual(exitcode, 0)
         logs = self.client.logs(id)
-        self.assertEqual(logs, snippet + '\n')
+        self.assertEqual(logs, (snippet + '\n').encode(encoding='ascii'))
 
 
-class TestLogsStreaming(BaseTestCase):
-    def runTest(self):
-        snippet = 'Flowering Nights (Sakuya Iyazoi)'
-        container = self.client.create_container(
-            'busybox', 'echo {0}'.format(snippet)
-        )
-        id = container['Id']
-        self.client.start(id)
-        self.tmp_containers.append(id)
-        logs = ''
-        for chunk in self.client.logs(id, stream=True):
-            logs += chunk
+# class TestLogsStreaming(BaseTestCase):
+#     def runTest(self):
+#         snippet = 'Flowering Nights (Sakuya Iyazoi)'
+#         container = self.client.create_container(
+#             'busybox', 'echo {0}'.format(snippet)
+#         )
+#         id = container['Id']
+#         self.client.start(id)
+#         self.tmp_containers.append(id)
+#         logs = bytes() if six.PY3 else str()
+#         for chunk in self.client.logs(id, stream=True):
+#             logs += chunk
 
-        exitcode = self.client.wait(id)
-        self.assertEqual(exitcode, 0)
+#         exitcode = self.client.wait(id)
+#         self.assertEqual(exitcode, 0)
 
-        self.assertEqual(logs, snippet + '\n')
+#         self.assertEqual(logs, (snippet + '\n').encode(encoding='ascii'))
 
 
 class TestLogsWithDictInsteadOfId(BaseTestCase):
@@ -303,7 +320,7 @@ class TestLogsWithDictInsteadOfId(BaseTestCase):
         exitcode = self.client.wait(id)
         self.assertEqual(exitcode, 0)
         logs = self.client.logs(container)
-        self.assertEqual(logs, snippet + '\n')
+        self.assertEqual(logs, (snippet + '\n').encode(encoding='ascii'))
 
 
 class TestDiff(BaseTestCase):
@@ -531,17 +548,20 @@ class TestStartContainerWithVolumesFrom(BaseTestCase):
         container2_id = res1['Id']
         self.tmp_containers.append(container2_id)
         self.client.start(container2_id)
-
+        with self.assertRaises(docker.errors.DockerException):
+            res2 = self.client.create_container(
+                'busybox', 'cat',
+                detach=True, stdin_open=True,
+                volumes_from=vol_names)
         res2 = self.client.create_container(
             'busybox', 'cat',
-            detach=True, stdin_open=True,
-            volumes_from=vol_names)
+            detach=True, stdin_open=True)
         container3_id = res2['Id']
         self.tmp_containers.append(container3_id)
-        self.client.start(container3_id)
+        self.client.start(container3_id, volumes_from=vol_names)
 
         info = self.client.inspect_container(res2['Id'])
-        self.assertEqual(info['Config']['VolumesFrom'], ','.join(vol_names))
+        self.assertItemsEqual(info['HostConfig']['VolumesFrom'], vol_names)
 
 
 class TestStartContainerWithLinks(BaseTestCase):
@@ -641,7 +661,7 @@ class TestPull(BaseTestCase):
         try:
             self.client.remove_image('joffrey/test001')
             self.client.remove_image('376968a23351')
-        except docker.APIError:
+        except docker.errors.APIError:
             pass
         info = self.client.info()
         self.assertIn('Images', info)
@@ -650,7 +670,7 @@ class TestPull(BaseTestCase):
         self.assertEqual(type(res), six.text_type)
         self.assertEqual(img_count + 3, self.client.info()['Images'])
         img_info = self.client.inspect_image('joffrey/test001')
-        self.assertIn('id', img_info)
+        self.assertIn('Id', img_info)
         self.tmp_imgs.append('joffrey/test001')
         self.tmp_imgs.append('376968a23351')
 
@@ -660,19 +680,17 @@ class TestPullStream(BaseTestCase):
         try:
             self.client.remove_image('joffrey/test001')
             self.client.remove_image('376968a23351')
-        except docker.APIError:
+        except docker.errors.APIError:
             pass
         info = self.client.info()
         self.assertIn('Images', info)
         img_count = info['Images']
         stream = self.client.pull('joffrey/test001', stream=True)
-        res = u''
         for chunk in stream:
-            res += chunk
-        self.assertEqual(type(res), six.text_type)
+            json.loads(chunk)  # ensure chunk is a single, valid JSON blob
         self.assertEqual(img_count + 3, self.client.info()['Images'])
         img_info = self.client.inspect_image('joffrey/test001')
-        self.assertIn('id', img_info)
+        self.assertIn('Id', img_info)
         self.tmp_imgs.append('joffrey/test001')
         self.tmp_imgs.append('376968a23351')
 
@@ -688,14 +706,14 @@ class TestCommit(BaseTestCase):
         img_id = res['Id']
         self.tmp_imgs.append(img_id)
         img = self.client.inspect_image(img_id)
-        self.assertIn('container', img)
-        self.assertTrue(img['container'].startswith(id))
-        self.assertIn('container_config', img)
-        self.assertIn('Image', img['container_config'])
-        self.assertEqual('busybox', img['container_config']['Image'])
-        busybox_id = self.client.inspect_image('busybox')['id']
-        self.assertIn('parent', img)
-        self.assertEqual(img['parent'], busybox_id)
+        self.assertIn('Container', img)
+        self.assertTrue(img['Container'].startswith(id))
+        self.assertIn('ContainerConfig', img)
+        self.assertIn('Image', img['ContainerConfig'])
+        self.assertEqual('busybox', img['ContainerConfig']['Image'])
+        busybox_id = self.client.inspect_image('busybox')['Id']
+        self.assertIn('Parent', img)
+        self.assertEqual(img['Parent'], busybox_id)
 
 
 class TestRemoveImage(BaseTestCase):
@@ -762,6 +780,7 @@ class TestBuildStream(BaseTestCase):
         stream = self.client.build(fileobj=script, stream=True)
         logs = ''
         for chunk in stream:
+            json.loads(chunk)  # ensure chunk is a single, valid JSON blob
             logs += chunk
         self.assertNotEqual(logs, '')
 
@@ -839,6 +858,7 @@ class TestRunShlex(BaseTestCase):
 class TestLoadConfig(BaseTestCase):
     def runTest(self):
         folder = tempfile.mkdtemp()
+        self.tmp_folders.append(folder)
         f = open(os.path.join(folder, '.dockercfg'), 'w')
         auth_ = base64.b64encode(b'sakuya:izayoi').decode('ascii')
         f.write('auth = {0}\n'.format(auth_))
@@ -856,6 +876,7 @@ class TestLoadConfig(BaseTestCase):
 class TestLoadJSONConfig(BaseTestCase):
     def runTest(self):
         folder = tempfile.mkdtemp()
+        self.tmp_folders.append(folder)
         f = open(os.path.join(folder, '.dockercfg'), 'w')
         auth_ = base64.b64encode(b'sakuya:izayoi').decode('ascii')
         email_ = 'sakuya@scarlet.net'
@@ -891,4 +912,6 @@ class TestConnectionTimeout(unittest.TestCase):
 
 
 if __name__ == '__main__':
+    c = docker.Client(base_url=DEFAULT_BASE_URL)
+    c.pull('busybox')
     unittest.main()

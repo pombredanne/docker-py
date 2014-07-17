@@ -20,6 +20,11 @@ from distutils.version import StrictVersion
 import requests
 import six
 
+from .. import errors
+
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_UNIX_SOCKET = "http+unix://var/run/docker.sock"
+
 
 def mkbuildcontext(dockerfile):
     f = tempfile.NamedTemporaryFile()
@@ -92,6 +97,13 @@ def _convert_port_binding(binding):
             result['HostIp'] = binding[0]
         else:
             result['HostPort'] = binding[0]
+    elif isinstance(binding, dict):
+        if 'HostPort' in binding:
+            result['HostPort'] = binding['HostPort']
+            if 'HostIp' in binding:
+                result['HostIp'] = binding['HostIp']
+        else:
+            raise ValueError(binding)
     else:
         result['HostPort'] = binding
 
@@ -116,13 +128,87 @@ def convert_port_bindings(port_bindings):
     return result
 
 
+def convert_volume_binds(binds):
+    result = []
+    for k, v in binds.items():
+        if isinstance(v, dict):
+            result.append('%s:%s:%s' % (
+                k, v['bind'], 'ro' if v.get('ro', False) else 'rw'
+            ))
+        else:
+            result.append('%s:%s:rw' % (k, v))
+    return result
+
+
 def parse_repository_tag(repo):
     column_index = repo.rfind(':')
     if column_index < 0:
-        return repo, ""
-    tag = repo[column_index+1:]
+        return repo, None
+    tag = repo[column_index + 1:]
     slash_index = tag.find('/')
     if slash_index < 0:
         return repo[:column_index], tag
 
-    return repo, ""
+    return repo, None
+
+
+# Based on utils.go:ParseHost http://tinyurl.com/nkahcfh
+# fd:// protocol unsupported (for obvious reasons)
+# Added support for http and https
+# Protocol translation: tcp -> http, unix -> http+unix
+def parse_host(addr):
+    proto = "http+unix"
+    host = DEFAULT_HTTP_HOST
+    port = None
+    if not addr or addr.strip() == 'unix://':
+        return DEFAULT_UNIX_SOCKET
+
+    addr = addr.strip()
+    if addr.startswith('http://'):
+        addr = addr.replace('http://', 'tcp://')
+    if addr.startswith('http+unix://'):
+        addr = addr.replace('http+unix://', 'unix://')
+
+    if addr == 'tcp://':
+        raise errors.DockerException("Invalid bind address format: %s" % addr)
+    elif addr.startswith('unix://'):
+        addr = addr[7:]
+    elif addr.startswith('tcp://'):
+        proto = "http"
+        addr = addr[6:]
+    elif addr.startswith('https://'):
+        proto = "https"
+        addr = addr[8:]
+    elif addr.startswith('fd://'):
+        raise errors.DockerException("fd protocol is not implemented")
+    else:
+        if "://" in addr:
+            raise errors.DockerException(
+                "Invalid bind address protocol: %s" % addr
+            )
+        proto = "http"
+
+    if proto != "http+unix" and ":" in addr:
+        host_parts = addr.split(':')
+        if len(host_parts) != 2:
+            raise errors.DockerException(
+                "Invalid bind address format: %s" % addr
+            )
+        if host_parts[0]:
+            host = host_parts[0]
+
+        try:
+            port = int(host_parts[1])
+        except Exception:
+            raise errors.DockerException(
+                "Invalid port: %s", addr
+            )
+
+    elif proto in ("http", "https") and ':' not in addr:
+        raise errors.DockerException("Bind address needs a port: %s" % addr)
+    else:
+        host = addr
+
+    if proto == "http+unix":
+        return "%s://%s" % (proto, host)
+    return "%s://%s:%d" % (proto, host, port)
